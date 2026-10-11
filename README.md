@@ -50,8 +50,9 @@ sudo systemctl enable --now reliveit-metrics
 curl http://192.168.11.155:3020/healthz   # {"status":"ok"}
 ```
 
-The table and its indexes are created on startup if they are missing. Logs are in
-`journalctl -u reliveit-metrics`; rejected snapshots are logged there with the reason.
+The table and its indexes are created on startup if they are missing. `journalctl -u
+reliveit-metrics` shows one line per stored batch and one per rejected snapshot, with the
+reason; a 401 from a wrong key is not logged, the game just keeps retrying.
 
 **4. Route it through nginx** on the host that serves kurkisoft.com. `deploy/nginx.conf` is
 the `data.kurkisoft.com` server block plus the rate limit line, with the steps to install it

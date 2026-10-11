@@ -100,6 +100,10 @@ app.MapPost("/v1/snapshots", async (HttpRequest request, SnapshotBatch batch, Np
         await transaction.CommitAsync(ct);
     }
 
+    Snapshot? first = valid.Count > 0 ? valid[0].Source : null;
+    log.LogInformation("Stored {Accepted} snapshots from {Platform} / {Build} ({Duplicates} duplicates, {Rejected} rejected)",
+        inserted, first?.Platform ?? "?", first?.Build ?? "?", valid.Count - inserted, rejected);
+
     return Results.Ok(new { accepted = inserted, duplicates = valid.Count - inserted, rejected });
 });
 
