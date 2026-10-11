@@ -58,10 +58,10 @@ the `data.kurkisoft.com` server block plus the rate limit line, with the steps t
 and have certbot add https. Once that is done:
 
 ```sh
-curl https://data.kurkisoft.com/v1/snapshots -X POST -H "Content-Type: application/json" -d '{}'
+curl -i https://data.kurkisoft.com/v1/snapshots -X POST -H "Content-Type: application/json" -d '{}'
 ```
 
-That last request should answer `401`: it reached the server and was refused for having no
+That last request should answer `HTTP/1.1 401` with an empty body: it reached the server and was refused for having no
 key.
 
 **5. Point the game at it:**
