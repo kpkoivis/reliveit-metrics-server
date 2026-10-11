@@ -1,0 +1,2 @@
+# These files end up on a Linux host; a CRLF in the env file would put a  on the password.
+* text=auto eol=lf
