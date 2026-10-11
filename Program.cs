@@ -11,6 +11,8 @@ using NpgsqlTypes;
 const string ApiKeyHeader = "X-Metrics-Key";
 const int MaxBatchSize = 100;
 const int MaxTextLength = 200;
+// numeric has no limit of its own; a balance or price this large is not from the game.
+const decimal MaxMoney = 1_000_000_000_000_000M;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -141,18 +143,29 @@ static string? Validate(Snapshot? s, out ValidSnapshot? valid)
     List<Activity> sideActivities = (s.SideActivities ?? new()).Where(a => a is not null).Select(a => a!).ToList();
     List<string> iapPurchases = (s.IapPurchases ?? new()).Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p!).ToList();
 
-    if (sideActivities.Count > 16 || iapPurchases.Count > 32)
-        return "too many side activities or purchases";
+    List<ShopPurchase> shopPurchases = (s.ShopPurchases ?? new()).Where(p => p is not null).Select(p => p!).ToList();
+    List<string> activities = (s.Activities ?? new()).Where(a => !string.IsNullOrWhiteSpace(a)).Select(a => a!).ToList();
+
+    if (sideActivities.Count > 16 || iapPurchases.Count > 32 || shopPurchases.Count > 64 || activities.Count > 64)
+        return "too many side activities, purchases or activities";
+
+    if (s.BankBalance is decimal balance && Math.Abs(balance) >= MaxMoney)
+        return "bank_balance is out of range";
+
+    if (shopPurchases.Any(p => p.Cost is decimal cost && Math.Abs(cost) >= MaxMoney))
+        return "a shop purchase cost is out of range";
 
     IEnumerable<string?> texts = new[] { s.TreeId, s.TreeItemId, s.AppVersion, s.Platform, s.Build }
         .Concat(iapPurchases)
+        .Concat(activities)
+        .Concat(shopPurchases.SelectMany(p => new[] { p.Name, p.Category, p.Subcategory }))
         .Concat(sideActivities.Append(s.MainActivity ?? new Activity(null, null, null))
             .SelectMany(a => new[] { a.Type, a.Kind, a.Name }));
 
     if (texts.Any(TooLong))
         return "a text field is too long";
 
-    valid = new ValidSnapshot(id, recordedAt.ToUniversalTime(), s, sideActivities, iapPurchases);
+    valid = new ValidSnapshot(id, recordedAt.ToUniversalTime(), s, sideActivities, iapPurchases, shopPurchases, activities);
     return null;
 }
 
@@ -181,6 +194,9 @@ static NpgsqlBatchCommand InsertCommand(ValidSnapshot v)
     command.Parameters.Add(Text(s.Platform));
     command.Parameters.Add(Text(s.Build));
     command.Parameters.Add(new() { Value = s.SchemaVersion ?? 1 });
+    command.Parameters.Add(new() { NpgsqlDbType = NpgsqlDbType.Numeric, Value = (object?)s.BankBalance ?? DBNull.Value });
+    command.Parameters.Add(new() { NpgsqlDbType = NpgsqlDbType.Jsonb, Value = JsonSerializer.Serialize(v.ShopPurchases, Sql.JsonOptions) });
+    command.Parameters.Add(new() { NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Text, Value = v.Activities.ToArray() });
 
     return command;
 }
@@ -193,6 +209,8 @@ static NpgsqlParameter Text(string? value) => new() { NpgsqlDbType = NpgsqlDbTyp
 record SnapshotBatch(List<Snapshot?>? Snapshots);
 
 record Activity(string? Type, string? Kind, string? Name);
+
+record ShopPurchase(string? Name, string? Category, string? Subcategory, decimal? Cost);
 
 record Snapshot(
     string? Id,
@@ -209,9 +227,13 @@ record Snapshot(
     bool? Autopilot,
     string? AppVersion,
     string? Platform,
-    string? Build);
+    string? Build,
+    decimal? BankBalance,
+    List<ShopPurchase?>? ShopPurchases,
+    List<string?>? Activities);
 
-record ValidSnapshot(Guid Id, DateTimeOffset RecordedAt, Snapshot Source, List<Activity> SideActivities, List<string> IapPurchases);
+record ValidSnapshot(Guid Id, DateTimeOffset RecordedAt, Snapshot Source, List<Activity> SideActivities, List<string> IapPurchases,
+    List<ShopPurchase> ShopPurchases, List<string> Activities);
 
 static class Sql
 {
@@ -242,6 +264,12 @@ static class Sql
             schema_version      integer not null
         );
 
+        -- Added after the first release; "if not exists" upgrades a table made before them.
+        -- shop_purchases is a json array of {name, category, subcategory, cost}.
+        alter table age_up_snapshots add column if not exists bank_balance numeric;
+        alter table age_up_snapshots add column if not exists shop_purchases jsonb not null default '[]';
+        alter table age_up_snapshots add column if not exists activities text[] not null default '{}';
+
         create index if not exists age_up_snapshots_user_idx on age_up_snapshots (user_id, recorded_at);
         create index if not exists age_up_snapshots_game_idx on age_up_snapshots (game_id, age_months);
         create index if not exists age_up_snapshots_received_idx on age_up_snapshots (received_at);
@@ -251,8 +279,9 @@ static class Sql
         insert into age_up_snapshots (
             id, recorded_at, user_id, game_id, age_months, tree_id, tree_item_id,
             main_activity_type, main_activity_kind, main_activity_name,
-            side_activities, iap_purchases, autopilot, app_version, platform, build, schema_version)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            side_activities, iap_purchases, autopilot, app_version, platform, build, schema_version,
+            bank_balance, shop_purchases, activities)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         on conflict (id) do nothing
         """;
 }

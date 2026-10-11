@@ -127,6 +127,9 @@ dotnet run
       "main_activity": { "type": "Job", "kind": "Baker", "name": "Baker" },
       "side_activities": [ { "type": "Hobby", "kind": null, "name": "Drawing" } ],
       "iap_purchases": [ "com.kurkisoft.reliveit.iap.agedown" ],
+      "bank_balance": 15230.50,
+      "shop_purchases": [ { "name": "Rusty bike", "category": "SimpleTransport", "subcategory": "Bicycle", "cost": 45.00 } ],
+      "activities": [ "ListenToClassicalMusicActivity", "GoForAWalkActivity" ],
       "autopilot": false,
       "app_version": "1.0.5",
       "platform": "Android",
@@ -160,6 +163,9 @@ which is what makes the game's retries safe.
 | `main_activity_*` | `kind` is only set for jobs, schools and lifetime activities. |
 | `side_activities` | JSON array of `{type, kind, name}`. Empty slots are left out. |
 | `iap_purchases` | Products bought since the previous snapshot, not everything owned. |
+| `bank_balance` | In-game money at the end of the turn. Null on rows from game versions before it was added. |
+| `shop_purchases` | JSON array of `{name, category, subcategory, cost}`: items bought from the in-game shop during the turn. |
+| `activities` | Activities started from the activities panel during the turn, by class name, in order and with repeats. Activities offered by an owned asset are not included. |
 | `autopilot` | The turn was played by autopilot, not the player. |
 | `build` | `Development`, `Stakeholder`, `Pre-18` or `Stakeholder, pre-18`. Filter on it. |
 
@@ -201,6 +207,25 @@ What gets bought, and at what age:
 select product, count(*) as purchases, round(avg(age_months) / 12.0, 1) as avg_age_years
 from age_up_snapshots, unnest(iap_purchases) as product
 group by product;
+
+select item->>'category' as category, item->>'name' as name, count(*) as bought,
+       round(avg((item->>'cost')::numeric)) as avg_cost
+from age_up_snapshots, jsonb_array_elements(shop_purchases) as item
+group by 1, 2 order by bought desc;
+```
+
+Which activities get played, and how money grows with age:
+
+```sql
+select activity, count(*) as times_played
+from age_up_snapshots, unnest(activities) as activity
+where not autopilot
+group by 1 order by 2 desc;
+
+select floor(age_months / 12) as age_years, percentile_cont(0.5) within group (order by bank_balance) as median_balance
+from age_up_snapshots
+where bank_balance is not null
+group by 1 order by 1;
 ```
 
 ## Changing the format
