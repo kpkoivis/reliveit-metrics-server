@@ -109,6 +109,58 @@ app.MapPost("/v1/snapshots", async (HttpRequest request, SnapshotBatch batch, Np
     return Results.Ok(new { accepted = inserted, duplicates = valid.Count - inserted, rejected });
 });
 
+app.MapPost("/v1/purchases", async (HttpRequest request, PurchaseBatch batch, NpgsqlDataSource db, ILogger<Program> log, CancellationToken ct) =>
+{
+    if (!KeyMatches(request.Headers[ApiKeyHeader].ToString(), apiKey))
+        return Results.Unauthorized();
+
+    if (batch.Purchases is null || batch.Purchases.Count == 0)
+        return Results.BadRequest(new { error = "The batch has no purchases." });
+
+    if (batch.Purchases.Count > MaxBatchSize)
+        return Results.BadRequest(new { error = $"A batch may hold at most {MaxBatchSize} purchases." });
+
+    List<ValidPurchase> valid = new();
+    int rejected = 0;
+
+    foreach (Purchase? purchase in batch.Purchases)
+    {
+        string? problem = ValidatePurchase(purchase, out ValidPurchase? ok);
+
+        if (problem is null)
+        {
+            valid.Add(ok!);
+        }
+        else
+        {
+            rejected++;
+            log.LogWarning("Rejected purchase {Id}: {Problem}", purchase?.Id, problem);
+        }
+    }
+
+    int inserted = 0;
+
+    if (valid.Count > 0)
+    {
+        await using NpgsqlConnection connection = await db.OpenConnectionAsync(ct);
+        await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(ct);
+        await using NpgsqlBatch insert = new(connection, transaction);
+
+        foreach (ValidPurchase p in valid)
+            insert.BatchCommands.Add(InsertPurchaseCommand(p));
+
+        // Either unique key makes a row a duplicate: the report's own id (a resend) or the
+        // store's purchase token (the same order reported twice).
+        inserted = await insert.ExecuteNonQueryAsync(ct);
+        await transaction.CommitAsync(ct);
+    }
+
+    foreach (ValidPurchase p in valid)
+        log.LogInformation("Purchase {Product} {Price} {Currency} from {Build}", p.Source.ProductId, p.Source.Price, p.Source.Currency, p.Source.Build);
+
+    return Results.Ok(new { accepted = inserted, duplicates = valid.Count - inserted, rejected });
+});
+
 app.Run();
 
 static bool KeyMatches(string given, string expected)
@@ -170,6 +222,67 @@ static string? Validate(Snapshot? s, out ValidSnapshot? valid)
 }
 
 static bool TooLong(string? text) => text is not null && text.Length > MaxTextLength;
+
+static string? ValidatePurchase(Purchase? p, out ValidPurchase? valid)
+{
+    valid = null;
+
+    if (p is null)
+        return "null entry";
+
+    if (!Guid.TryParse(p.Id, out Guid id))
+        return "id is not a guid";
+
+    if (!DateTimeOffset.TryParse(p.RecordedAt, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out DateTimeOffset recordedAt))
+        return "recorded_at is not a timestamp";
+
+    if (string.IsNullOrWhiteSpace(p.UserId) || TooLong(p.UserId))
+        return "user_id is missing or too long";
+
+    if (string.IsNullOrWhiteSpace(p.ProductId) || TooLong(p.ProductId))
+        return "product_id is missing or too long";
+
+    if (p.AgeMonths is long age && age is < 0 or > 2400)
+        return "age_months is out of range";
+
+    if (p.Price is decimal price && (price < 0 || price >= MaxMoney))
+        return "price is out of range";
+
+    // Google's purchase tokens run to a few hundred characters.
+    if (p.PurchaseToken is { Length: > 2000 })
+        return "purchase_token is too long";
+
+    if (new[] { p.GameId, p.Currency, p.Store, p.OrderId, p.AppVersion, p.Platform, p.Build }.Any(TooLong))
+        return "a text field is too long";
+
+    valid = new ValidPurchase(id, recordedAt.ToUniversalTime(), p);
+    return null;
+}
+
+static NpgsqlBatchCommand InsertPurchaseCommand(ValidPurchase v)
+{
+    Purchase p = v.Source;
+
+    NpgsqlBatchCommand command = new(Sql.InsertPurchase);
+
+    command.Parameters.Add(new() { Value = v.Id });
+    command.Parameters.Add(new() { Value = v.RecordedAt });
+    command.Parameters.Add(Text(p.UserId));
+    command.Parameters.Add(Text(p.GameId));
+    command.Parameters.Add(new() { NpgsqlDbType = NpgsqlDbType.Integer, Value = p.AgeMonths is long age ? (int)age : DBNull.Value });
+    command.Parameters.Add(Text(p.ProductId));
+    command.Parameters.Add(new() { NpgsqlDbType = NpgsqlDbType.Numeric, Value = (object?)p.Price ?? DBNull.Value });
+    command.Parameters.Add(Text(p.Currency));
+    command.Parameters.Add(Text(p.Store));
+    command.Parameters.Add(Text(string.IsNullOrWhiteSpace(p.OrderId) ? null : p.OrderId));
+    command.Parameters.Add(Text(string.IsNullOrWhiteSpace(p.PurchaseToken) ? null : p.PurchaseToken));
+    command.Parameters.Add(Text(p.AppVersion));
+    command.Parameters.Add(Text(p.Platform));
+    command.Parameters.Add(Text(p.Build));
+    command.Parameters.Add(new() { Value = p.SchemaVersion ?? 1 });
+
+    return command;
+}
 
 static NpgsqlBatchCommand InsertCommand(ValidSnapshot v)
 {
@@ -235,6 +348,27 @@ record Snapshot(
 record ValidSnapshot(Guid Id, DateTimeOffset RecordedAt, Snapshot Source, List<Activity> SideActivities, List<string> IapPurchases,
     List<ShopPurchase> ShopPurchases, List<string> Activities);
 
+record PurchaseBatch(List<Purchase?>? Purchases);
+
+record Purchase(
+    string? Id,
+    int? SchemaVersion,
+    string? RecordedAt,
+    string? UserId,
+    string? GameId,
+    long? AgeMonths,
+    string? ProductId,
+    decimal? Price,
+    string? Currency,
+    string? Store,
+    string? OrderId,
+    string? PurchaseToken,
+    string? AppVersion,
+    string? Platform,
+    string? Build);
+
+record ValidPurchase(Guid Id, DateTimeOffset RecordedAt, Purchase Source);
+
 static class Sql
 {
     public static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
@@ -273,6 +407,39 @@ static class Sql
         create index if not exists age_up_snapshots_user_idx on age_up_snapshots (user_id, recorded_at);
         create index if not exists age_up_snapshots_game_idx on age_up_snapshots (game_id, age_months);
         create index if not exists age_up_snapshots_received_idx on age_up_snapshots (received_at);
+
+        -- One row per in-app purchase the store confirmed, posted as it happens. price is in
+        -- currency, as the store showed it to the player (before Google's cut and taxes).
+        create table if not exists iap_purchases (
+            id                  uuid primary key,
+            received_at         timestamptz not null default now(),
+            recorded_at         timestamptz not null,
+            user_id             text not null,
+            game_id             text,
+            age_months          integer,
+            product_id          text not null,
+            price               numeric,
+            currency            text,
+            store               text,
+            order_id            text,
+            purchase_token      text,
+            app_version         text,
+            platform            text,
+            build               text,
+            schema_version      integer not null
+        );
+
+        create unique index if not exists iap_purchases_token_idx on iap_purchases (purchase_token) where purchase_token is not null;
+        create index if not exists iap_purchases_user_idx on iap_purchases (user_id, recorded_at);
+        create index if not exists iap_purchases_received_idx on iap_purchases (received_at);
+        """;
+
+    public const string InsertPurchase = """
+        insert into iap_purchases (
+            id, recorded_at, user_id, game_id, age_months, product_id, price, currency, store,
+            order_id, purchase_token, app_version, platform, build, schema_version)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        on conflict do nothing
         """;
 
     public const string Insert = """
