@@ -205,8 +205,8 @@ order reported twice are both counted as duplicates.
 
 | Column | Notes |
 | --- | --- |
-| `user_id` | The same random per-install id as in the snapshots, so the two tables join on it. |
-| `game_id`, `age_months` | The life being played and the character's age when the purchase was made. Null when bought outside a life. |
+| `user_id` | The same random per-install id as in the snapshots, so the two tables join on it. Null when the player has no statistics: everyone in the EU/EEA, the UK and Switzerland, and players elsewhere who turned statistics off. Those rows are bare sales records. |
+| `game_id`, `age_months` | The life being played and the character's age when the purchase was made. Null when bought outside a life, and on bare sales records. |
 | `price`, `currency` | What the store showed the player, before Google's cut and taxes. Null if the game never received the product list. Prices in different currencies cannot be summed as they are. |
 | `store` | `GooglePlay` on Android. Purchases from the editor's fake store carry its own name, or null. |
 | `order_id` | Google's order id (`GPA.…`), the one Play Console and refunds use. Null for license-tester and editor purchases. |

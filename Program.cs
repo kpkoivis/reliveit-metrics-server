@@ -236,8 +236,10 @@ static string? ValidatePurchase(Purchase? p, out ValidPurchase? valid)
     if (!DateTimeOffset.TryParse(p.RecordedAt, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out DateTimeOffset recordedAt))
         return "recorded_at is not a timestamp";
 
-    if (string.IsNullOrWhiteSpace(p.UserId) || TooLong(p.UserId))
-        return "user_id is missing or too long";
+    // user_id is optional: a player with statistics off (and everyone in the EU, the UK and
+    // Switzerland) reports purchases as bare sales records, with no install id, game or age.
+    if (TooLong(p.UserId))
+        return "user_id is too long";
 
     if (string.IsNullOrWhiteSpace(p.ProductId) || TooLong(p.ProductId))
         return "product_id is missing or too long";
@@ -267,7 +269,7 @@ static NpgsqlBatchCommand InsertPurchaseCommand(ValidPurchase v)
 
     command.Parameters.Add(new() { Value = v.Id });
     command.Parameters.Add(new() { Value = v.RecordedAt });
-    command.Parameters.Add(Text(p.UserId));
+    command.Parameters.Add(Text(string.IsNullOrWhiteSpace(p.UserId) ? null : p.UserId));
     command.Parameters.Add(Text(p.GameId));
     command.Parameters.Add(new() { NpgsqlDbType = NpgsqlDbType.Integer, Value = p.AgeMonths is long age ? (int)age : DBNull.Value });
     command.Parameters.Add(Text(p.ProductId));
@@ -414,7 +416,7 @@ static class Sql
             id                  uuid primary key,
             received_at         timestamptz not null default now(),
             recorded_at         timestamptz not null,
-            user_id             text not null,
+            user_id             text,
             game_id             text,
             age_months          integer,
             product_id          text not null,
@@ -428,6 +430,10 @@ static class Sql
             build               text,
             schema_version      integer not null
         );
+
+        -- Sales records without statistics carry no install id. A table made by the first
+        -- release of this endpoint required one.
+        alter table iap_purchases alter column user_id drop not null;
 
         create unique index if not exists iap_purchases_token_idx on iap_purchases (purchase_token) where purchase_token is not null;
         create index if not exists iap_purchases_user_idx on iap_purchases (user_id, recorded_at);
