@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -13,17 +14,23 @@ const int MaxBatchSize = 100;
 const int MaxTextLength = 200;
 // numeric has no limit of its own; a balance or price this large is not from the game.
 const decimal MaxMoney = 1_000_000_000_000_000M;
+// A page view beacon is one small object. Anything larger is not from the beacon.
+const int MaxPageViewBody = 4 * 1024;
 
 var builder = WebApplication.CreateBuilder(args);
 
 string connectionString = builder.Configuration.GetConnectionString("Metrics") ?? "";
 string apiKey = builder.Configuration["Metrics:ApiKey"] ?? "";
+string visitorSalt = builder.Configuration["Metrics:VisitorSalt"] ?? "";
 
 if (string.IsNullOrWhiteSpace(connectionString))
     throw new InvalidOperationException("ConnectionStrings:Metrics is not set.");
 
 if (string.IsNullOrWhiteSpace(apiKey))
     throw new InvalidOperationException("Metrics:ApiKey is not set. It must match MetricsConfig.ApiKey in the game.");
+
+if (string.IsNullOrWhiteSpace(visitorSalt))
+    throw new InvalidOperationException("Metrics:VisitorSalt is not set. Any long random string works; changing it resets visitor counting.");
 
 // A full batch is a few tens of kilobytes. Anything much larger is not from the game.
 builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 256 * 1024);
@@ -109,6 +116,59 @@ app.MapPost("/v1/snapshots", async (HttpRequest request, SnapshotBatch batch, Np
     return Results.Ok(new { accepted = inserted, duplicates = valid.Count - inserted, rejected });
 });
 
+// The page view beacon on kurkisoft.com. Unlike the snapshots there is no key: the page is
+// public, so a key in it would be too. Validation, the nginx rate limit and the likely_bot
+// flag are what keep the table honest; filter on likely_bot when querying.
+app.MapPost("/v1/pageviews", async (HttpRequest request, NpgsqlDataSource db, ILogger<Program> log, CancellationToken ct) =>
+{
+    // navigator.sendBeacon cannot preflight, so the page posts its JSON as text/plain and
+    // the body is read by hand here.
+    if (request.ContentLength is > MaxPageViewBody)
+        return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+
+    string body;
+    using (StreamReader reader = new(request.Body, Encoding.UTF8))
+        body = await reader.ReadToEndAsync(ct);
+
+    if (body.Length > MaxPageViewBody)
+        return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+
+    PageView? page;
+
+    try
+    {
+        page = JsonSerializer.Deserialize<PageView>(body, Sql.JsonOptions);
+    }
+    catch (JsonException)
+    {
+        return Results.BadRequest(new { error = "The body is not JSON." });
+    }
+
+    string? problem = ValidatePageView(page, out ValidPageView? ok);
+
+    if (problem is not null)
+    {
+        log.LogWarning("Rejected page view: {Problem}", problem);
+        return Results.BadRequest(new { error = problem });
+    }
+
+    ValidPageView v = ok!;
+    string userAgent = Truncate(request.Headers.UserAgent.ToString());
+    bool likelyBot = userAgent.Length == 0 || Patterns.BotUserAgent.IsMatch(userAgent);
+
+    await using NpgsqlCommand insert = db.CreateCommand(Sql.InsertPageView);
+    insert.Parameters.Add(new() { Value = VisitorHash(visitorSalt, ClientAddress(request), userAgent) });
+    insert.Parameters.Add(new() { Value = v.Event });
+    insert.Parameters.Add(new() { Value = v.Path });
+    insert.Parameters.Add(Text(v.Referrer));
+    insert.Parameters.Add(new() { NpgsqlDbType = NpgsqlDbType.Integer, Value = (object?)v.Viewport ?? DBNull.Value });
+    insert.Parameters.Add(Text(userAgent.Length == 0 ? null : userAgent));
+    insert.Parameters.Add(new() { Value = likelyBot });
+    await insert.ExecuteNonQueryAsync(ct);
+
+    return Results.Ok(new { stored = true });
+});
+
 app.Run();
 
 static bool KeyMatches(string given, string expected)
@@ -170,6 +230,67 @@ static string? Validate(Snapshot? s, out ValidSnapshot? valid)
 }
 
 static bool TooLong(string? text) => text is not null && text.Length > MaxTextLength;
+
+static string Truncate(string text) => text.Length <= MaxTextLength ? text : text[..MaxTextLength];
+
+// Returns what is wrong with the page view, or null - and the cleaned up page view - when
+// nothing is.
+static string? ValidatePageView(PageView? p, out ValidPageView? valid)
+{
+    valid = null;
+
+    if (p is null)
+        return "null body";
+
+    if (string.IsNullOrWhiteSpace(p.Path) || TooLong(p.Path) || !p.Path.StartsWith('/'))
+        return "path is missing, too long or not absolute";
+
+    string eventName = string.IsNullOrWhiteSpace(p.Event) ? "pageview" : p.Event;
+
+    if (!Patterns.EventName.IsMatch(eventName))
+        return "event is not a short lowercase name";
+
+    // Only the referrer's origin is kept: the full url is someone else's structure and can
+    // carry personal tokens.
+    string? referrer = null;
+
+    if (!string.IsNullOrWhiteSpace(p.Referrer))
+    {
+        if (!Uri.TryCreate(p.Referrer, UriKind.Absolute, out Uri? uri) || uri.Scheme is not ("http" or "https"))
+            return "referrer is not an http url";
+
+        referrer = uri.GetLeftPart(UriPartial.Authority);
+
+        if (TooLong(referrer))
+            return "referrer is too long";
+    }
+
+    if (p.Viewport is < 0 or > 20000)
+        return "viewport is out of range";
+
+    valid = new ValidPageView(eventName, p.Path, referrer, p.Viewport);
+    return null;
+}
+
+// nginx passes the client's address in X-Forwarded-For; without one (a direct request on
+// the LAN) the socket address is used.
+static string ClientAddress(HttpRequest request)
+{
+    string forwarded = request.Headers["X-Forwarded-For"].ToString();
+
+    if (!string.IsNullOrWhiteSpace(forwarded))
+        return forwarded.Split(',')[0].Trim();
+
+    return request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "";
+}
+
+// The client's address is never stored; what is stored is a hash that rotates with the utc
+// day, so visitors can be counted within a day but not followed across days.
+static string VisitorHash(string salt, string address, string userAgent)
+{
+    byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes($"{salt}|{DateTime.UtcNow:yyyy-MM-dd}|{address}|{userAgent}"));
+    return Convert.ToHexStringLower(hash);
+}
 
 static NpgsqlBatchCommand InsertCommand(ValidSnapshot v)
 {
@@ -235,6 +356,21 @@ record Snapshot(
 record ValidSnapshot(Guid Id, DateTimeOffset RecordedAt, Snapshot Source, List<Activity> SideActivities, List<string> IapPurchases,
     List<ShopPurchase> ShopPurchases, List<string> Activities);
 
+record PageView(string? Path, string? Referrer, int? Viewport, string? Event);
+
+record ValidPageView(string Event, string Path, string? Referrer, int? Viewport);
+
+static class Patterns
+{
+    // The self-identifying crawlers and tools. A bot faking a real browser string slips
+    // through this and has to be caught as an outlier in the queries instead.
+    public static readonly Regex BotUserAgent = new(
+        "bot|crawl|spider|scrape|slurp|headless|lighthouse|pagespeed|pingdom|uptime|monitor|preview|facebookexternalhit|embedly|curl|wget|python|java/|libwww|httpclient|okhttp|axios|go-http",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public static readonly Regex EventName = new("^[a-z0-9][a-z0-9-]{0,49}$", RegexOptions.Compiled);
+}
+
 static class Sql
 {
     public static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
@@ -273,6 +409,24 @@ static class Sql
         create index if not exists age_up_snapshots_user_idx on age_up_snapshots (user_id, recorded_at);
         create index if not exists age_up_snapshots_game_idx on age_up_snapshots (game_id, age_months);
         create index if not exists age_up_snapshots_received_idx on age_up_snapshots (received_at);
+
+        -- One row per page view or click beacon from kurkisoft.com. visitor_hash is
+        -- sha256(salt | utc day | address | user agent): it counts a visitor within one day
+        -- and cannot be linked across days, and the address itself is never stored.
+        create table if not exists page_views (
+            id              bigint generated always as identity primary key,
+            received_at     timestamptz not null default now(),
+            visitor_hash    text not null,
+            event           text not null,
+            path            text not null,
+            referrer        text,
+            viewport        integer,
+            user_agent      text,
+            likely_bot      boolean not null default false
+        );
+
+        create index if not exists page_views_received_idx on page_views (received_at);
+        create index if not exists page_views_event_idx on page_views (event, path);
         """;
 
     public const string Insert = """
@@ -283,5 +437,10 @@ static class Sql
             bank_balance, shop_purchases, activities)
         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         on conflict (id) do nothing
+        """;
+
+    public const string InsertPageView = """
+        insert into page_views (visitor_hash, event, path, referrer, viewport, user_agent, likely_bot)
+        values ($1, $2, $3, $4, $5, $6, $7)
         """;
 }
