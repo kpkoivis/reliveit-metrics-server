@@ -109,6 +109,18 @@ dotnet run
 - **Rate limiting is nginx's job**, where the client's real IP address is known. The server
   has none of its own. `deploy/nginx.conf` sets it up.
 
+## Retention
+
+The privacy policy promises that gameplay statistics are kept for 24 months. The server
+enforces it itself, at startup and then once a day (`Retention.cs`):
+
+- `age_up_snapshots` rows older than that (by `received_at`) are deleted.
+- `iap_purchases` rows are sales records that accounting law requires keeping, so they stay;
+  once as old, their statistics part (`user_id`, `game_id`, `age_months`) is cleared.
+
+`Metrics__StatisticsRetentionMonths` changes the period; `0` turns deletion off. Each run
+logs one line: `Retention (24 months): deleted N snapshots, cleared statistics from M purchase records`.
+
 ## API
 
 `POST /v1/snapshots` with header `X-Metrics-Key` and a JSON body:

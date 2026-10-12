@@ -38,6 +38,9 @@ builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
 
 builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connectionString));
 
+// Deletes statistics older than the privacy policy promises to keep them. See Retention.cs.
+builder.Services.AddHostedService<RetentionService>();
+
 var app = builder.Build();
 
 app.UseCors();
@@ -438,6 +441,19 @@ static class Sql
         create unique index if not exists iap_purchases_token_idx on iap_purchases (purchase_token) where purchase_token is not null;
         create index if not exists iap_purchases_user_idx on iap_purchases (user_id, recorded_at);
         create index if not exists iap_purchases_received_idx on iap_purchases (received_at);
+        """;
+
+    // Retention, see Retention.cs. $1 is the number of months statistics are kept.
+    public const string DeleteOldSnapshots = """
+        delete from age_up_snapshots
+        where received_at < now() - make_interval(months => $1)
+        """;
+
+    public const string StripOldPurchaseStatistics = """
+        update iap_purchases
+        set user_id = null, game_id = null, age_months = null
+        where received_at < now() - make_interval(months => $1)
+          and (user_id is not null or game_id is not null or age_months is not null)
         """;
 
     public const string InsertPurchase = """
