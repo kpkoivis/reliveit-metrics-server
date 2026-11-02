@@ -2,7 +2,8 @@
 
 Receives the snapshot the game posts each time a player ages up, and the report it posts
 each time the store confirms an in-app purchase, and appends them to two Postgres tables,
-`age_up_snapshots` and `iap_purchases`. That is all it does.
+`age_up_snapshots` and `iap_purchases`. It also receives the page view beacon from
+kurkisoft.com into a third table, `page_views`. That is all it does.
 
 The game side lives in the `reliveit` repo under `Assets/Scripts/Metrics/`; this repo is only
 the server, so the Linux box needs nothing from the game.
@@ -80,6 +81,11 @@ While `EndpointUrl` is empty the game records and sends nothing.
 `sudo systemctl restart reliveit-metrics`. The game queues snapshots while the server is
 down and sends them once it is back.
 
+The page views release added `Metrics__VisitorSalt` to `/etc/reliveit-metrics.env`; the
+server refuses to start without it, so add it (see `deploy/reliveit-metrics.env.example`)
+before restarting onto that binary, and add the `/v1/pageviews` location to the nginx
+config (`deploy/nginx.conf`).
+
 ### With Docker instead
 
 `docker-compose.yml` runs the server and Postgres together. Change its `ports` line to
@@ -108,6 +114,10 @@ dotnet run
   field.
 - **Rate limiting is nginx's job**, where the client's real IP address is known. The server
   has none of its own. `deploy/nginx.conf` sets it up.
+
+`/v1/pageviews` has no key at all: it is posted by a public web page, so a key there would
+be public too. Validation, the rate limit and the `likely_bot` column are what keep that
+table honest.
 
 ## Retention
 
@@ -194,6 +204,22 @@ A purchase is stored once per `id` and once per `purchase_token`, so a resend an
 order reported twice are both counted as duplicates.
 
 `GET /healthz` returns `200` when the database answers.
+
+`POST /v1/pageviews` is the beacon kurkisoft.com fires once per page load, with no key and
+a `text/plain` body (because `navigator.sendBeacon` cannot send a preflighted request) that
+is still JSON:
+
+```json
+{ "path": "/reliveit/", "referrer": "https://news.ycombinator.com/item?id=1", "viewport": 390, "event": "pageview" }
+```
+
+`event` defaults to `pageview`; a click handler can post the same shape with another short
+lowercase name. `referrer` is cut down to its origin before storing. The server adds
+`received_at`, a daily rotating `visitor_hash` (the client's address is hashed, never
+stored), the truncated user agent, and `likely_bot` - true when the user agent is empty or
+matches the self-identifying crawler patterns. The beacon itself skips automated browsers
+(`navigator.webdriver`). Answers are `200 {"stored": true}`, `400` with the reason, or
+`413`; the beacon ignores them all.
 
 ## What the columns mean
 
@@ -311,6 +337,50 @@ select p.product_id,
 from iap_purchases p
 join (select user_id, min(recorded_at) as at from age_up_snapshots group by user_id) as first_seen using (user_id)
 group by 1;
+```
+
+## Page view queries
+
+Always filter `not likely_bot`: crawlers that execute no JavaScript never reach the table,
+and these flags cover most of the ones that do.
+
+Visitors and views by day:
+
+```sql
+select received_at::date as day, count(distinct visitor_hash) as visitors, count(*) as views
+from page_views
+where not likely_bot and event = 'pageview'
+group by 1 order by 1;
+```
+
+Top pages and where visitors come from:
+
+```sql
+select path, count(*) as views
+from page_views
+where not likely_bot and event = 'pageview'
+group by 1 order by 2 desc;
+
+select referrer, count(distinct visitor_hash) as visitors
+from page_views
+where not likely_bot and referrer is not null and referrer not like '%kurkisoft.com'
+group by 1 order by 2 desc;
+```
+
+The web funnel, per day: visits, play page views, and lives actually started in the web
+build (the game posts its first snapshot after the first age up):
+
+```sql
+select day, visitors, play_page, web_lives_started
+from (select received_at::date as day, count(distinct visitor_hash) as visitors,
+             count(distinct visitor_hash) filter (where path = '/reliveit/') as play_page
+      from page_views where not likely_bot and event = 'pageview' group by 1) as site
+left join (select first_seen::date as day2, count(*) as web_lives_started
+           from (select game_id, min(received_at) as first_seen
+                 from age_up_snapshots where platform ilike '%web%' group by game_id) as lives
+           group by 1) as game
+  on day = day2
+order by day;
 ```
 
 ## Changing the format
